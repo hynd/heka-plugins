@@ -64,6 +64,10 @@ type TcollectorInputConfig struct {
 	KeepAlive bool `toml:"keep_alive"`
 	// Integer indicating seconds between keep alives.
 	KeepAlivePeriod int `toml:"keep_alive_period"`
+	// Whether to discard messages if no input packs are available
+	DiscardOnFull bool `toml:"discard_on_full"`
+	// Whether to log the discarded record contents
+	LogDiscards bool `toml:"log_discards"`
 }
 
 func (t *TcollectorInput) ConfigStruct() interface{} {
@@ -96,7 +100,7 @@ func (t *TcollectorInput) Init(config interface{}) (err error) {
 func NetworkPayloadParserAndAnswer(conn net.Conn,
 	parser *TokenParser,
 	ir InputRunner,
-	signers map[string]Signer,
+	config *TcollectorInputConfig,
 	dr DecoderRunner) (err error) {
 
 	var (
@@ -122,26 +126,36 @@ func NetworkPayloadParserAndAnswer(conn net.Conn,
 			}
 			break
 		}
-    select {
-    case pack = <-ir.InChan():
-      pack = <-ir.InChan()
-      pack.Message.SetUuid(uuid.NewRandom())
-      pack.Message.SetTimestamp(time.Now().UnixNano())
-      pack.Message.SetType("NetworkInput")
-      // Only TCP packets have a remote address.
-      if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
-        pack.Message.SetHostname(remoteAddr.String())
-      }
-      pack.Message.SetLogger(ir.Name())
-      pack.Message.SetPayload(string(record))
-      if dr == nil {
-        ir.Inject(pack)
-      } else {
-        dr.InChan() <- pack
-      }
-    default:
-    }
+
+		if config.DiscardOnFull {
+			select {
+			case pack = <-ir.InChan():
+			default:
+				if config.LogDiscards {
+					ir.LogMessage(fmt.Sprintf("Dropped record: %s", record))
+				}
+				continue
+			}
+		} else {
+			pack = <-ir.InChan()
+		}
+
+		pack.Message.SetUuid(uuid.NewRandom())
+		pack.Message.SetTimestamp(time.Now().UnixNano())
+		pack.Message.SetType("NetworkInput")
+		// Only TCP packets have a remote address.
+		if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
+			pack.Message.SetHostname(remoteAddr.String())
+		}
+		pack.Message.SetLogger(ir.Name())
+		pack.Message.SetPayload(string(record))
+		if dr == nil {
+			ir.Inject(pack)
+		} else {
+			dr.InChan() <- pack
+		}
 	}
+
 	return
 }
 
@@ -180,7 +194,7 @@ func (t *TcollectorInput) handleConnection(conn net.Conn) {
 		case <-t.stopChan:
 			stopped = true
 		default:
-			err = NetworkPayloadParserAndAnswer(conn, parser, t.ir, t.config.Signers, dr)
+			err = NetworkPayloadParserAndAnswer(conn, parser, t.ir, t.config, dr)
 			if err != nil {
 				if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 					// keep the connection open, we are just checking to see if
