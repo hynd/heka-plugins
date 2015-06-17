@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mathpl/active_zabbix"
@@ -17,11 +18,21 @@ import (
 // Output plugin that sends messages via TCP using the Heka protocol.
 type ZabbixOutput struct {
 	conf            *ZabbixOutputConfig
-	key_filter      map[string]active_zabbix.HostActiveKeys
+	key_filter      keyFilterMap
 	key_seen_window time.Duration
-	key_seen        map[string]HostSeenKeys
+	key_seen        keySeenMap
 	zabbix_client   active_zabbix.ZabbixActiveClient
 	report_chan     chan chan reportMsg
+}
+
+type keyFilterMap struct {
+	m map[string]active_zabbix.HostActiveKeys
+	sync.RWMutex
+}
+
+type keySeenMap struct {
+	m map[string]HostSeenKeys
+	sync.RWMutex
 }
 
 type reportMsg struct {
@@ -74,16 +85,17 @@ func (zo *ZabbixOutput) Init(config interface{}) (err error) {
 
 	zo.zabbix_client, err = active_zabbix.NewZabbixActiveClient(zo.conf.Address, zo.conf.ReceiveTimeout, zo.conf.SendTimeout)
 	zo.report_chan = make(chan chan reportMsg, 1)
-	zo.key_filter = make(map[string]active_zabbix.HostActiveKeys)
+	zo.key_filter = keyFilterMap{m: make(map[string]active_zabbix.HostActiveKeys)}
 
 	zo.key_seen_window = time.Duration(zo.conf.KeySeenWindow) * time.Second
-	zo.key_seen = make(map[string]HostSeenKeys)
+	zo.key_seen = keySeenMap{m: make(map[string]HostSeenKeys)}
+
 	if zo.conf.OverrideHostname != "" {
-		zo.key_filter[zo.conf.OverrideHostname] = nil
+		zo.key_filter.m[zo.conf.OverrideHostname] = nil
 	} else {
 		var host string
 		host, err = os.Hostname()
-		zo.key_filter[host] = nil
+		zo.key_filter.m[host] = nil
 	}
 
 	// A bit of config validation
@@ -170,21 +182,29 @@ func (zo *ZabbixOutput) Filter(pack *PipelinePack) (discard bool, err error) {
 
 	// Populate key seen if enabled
 	if zo.conf.KeySeenWindow != 0 {
-		if hs, found := zo.key_seen[host]; !found || hs == nil {
-			zo.key_seen[host] = make(HostSeenKeys, 1)
+		zo.key_seen.Lock()
+		if hs, found := zo.key_seen.m[host]; !found || hs == nil {
+			zo.key_seen.m[host] = make(HostSeenKeys, 1)
 		}
-		zo.key_seen[host][key] = time.Now()
+		zo.key_seen.m[host][key] = time.Now()
+		zo.key_seen.Unlock()
 	}
 
 	// Check against active check filter
-	if hc, found_host := zo.key_filter[host]; found_host && hc != nil {
+	zo.key_filter.RLock()
+	hc, found_host := zo.key_filter.m[host]
+	zo.key_filter.RUnlock()
+
+	if found_host && hc != nil {
 		if _, found_key := hc[key]; found_key {
 			discard = false
 		}
 	} else {
 		// We have no data on current host, we'll need to fetch it!
 		// Discard by default
-		zo.key_filter[host] = nil
+		zo.key_filter.Lock()
+		zo.key_filter.m[host] = nil
+		zo.key_filter.Unlock()
 	}
 
 	return
@@ -206,61 +226,93 @@ func (zo *ZabbixOutput) SendMetrics(or OutputRunner, data [][]byte) (new_slice [
 	return
 }
 
+func (zo *ZabbixOutput) fetchZabbixChecks(or OutputRunner) {
+	or.LogMessage("Updating key_filter with FetchActiveChecks")
+	zo.key_filter.Lock()
+	for host, _ := range zo.key_filter.m {
+		if hc, localErr := zo.zabbix_client.FetchActiveChecks(host); localErr != nil {
+			// Keep previous list if the server can't refresh the list of checks
+			or.LogError(fmt.Errorf("Zabbix server unable to provide active check list for host %s: %s", host, localErr))
+		} else {
+			zo.key_filter.m[host] = hc
+		}
+	}
+	zo.key_filter.Unlock()
+}
+
 func (zo *ZabbixOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	var (
-		ok     = true
-		pack   *PipelinePack
-		inChan = or.InChan()
-		ticker = or.Ticker()
+		ok       = true
+		pack     *PipelinePack
+		inChan   = or.InChan()
+		ticker   = or.Ticker()
+		stopChan = make(chan struct{})
 	)
 
-	updateFilter := make(chan bool, 1)
-	go func() {
-		for zo.conf.ZabbixChecksPollInterval != 0 {
-			updateFilter <- true
-			time.Sleep(time.Duration(zo.conf.ZabbixChecksPollInterval) * time.Second)
-		}
-	}()
+	// Goroutine to ask Zabbix for which checks this host should have
+	if zo.conf.ZabbixChecksPollInterval > 0 {
+		// Run on startup without waiting for a whole Tick interval
+		zo.fetchZabbixChecks(or)
+		go func() {
+			for {
+				select {
+				case <-stopChan:
+					or.LogMessage("Exiting ZabbixChecksPollInterval goroutine")
+					return
 
-	keySeenCleanup := make(chan bool, 1)
-	go func() {
-		for zo.conf.KeySeenWindow != 0 {
-			keySeenCleanup <- true
-			time.Sleep(time.Duration(zo.conf.KeySeenWindow) * time.Second)
-		}
-	}()
+				case <-time.Tick(time.Duration(zo.conf.ZabbixChecksPollInterval) * time.Second):
+					zo.fetchZabbixChecks(or)
+				}
+			}
+		}()
+	}
+
+	// Goroutine to clear out keys that haven't updated in key_seen_window
+	if zo.conf.KeySeenWindow > 0 {
+		go func() {
+			for {
+				select {
+				case <-stopChan:
+					or.LogMessage("Exiting KeySeenWindow goroutine")
+					return
+
+				case <-time.Tick(time.Duration(zo.conf.KeySeenWindow) * time.Second):
+					or.LogMessage("Cleaning up keys")
+					zo.key_seen.Lock()
+					for host, hs := range zo.key_seen.m {
+						for key, t := range hs {
+							if time.Now().After(t.Add(zo.key_seen_window)) {
+								delete(hs, key)
+							}
+						}
+						if len(hs) == 0 {
+							delete(zo.key_seen.m, host)
+						}
+					}
+					zo.key_seen.Unlock()
+				}
+			}
+		}()
+	}
 
 	dataArray := make([][]byte, zo.conf.MaxKeyCount)
 	dataSlice := dataArray[0:0]
 	for ok {
 		select {
-		case <-updateFilter:
-			if !ok {
-				break
-			}
-
-			// FIXME: Move to seperate goroutine so it's non-blocking
-			for host, _ := range zo.key_filter {
-				if hc, localErr := zo.zabbix_client.FetchActiveChecks(host); localErr != nil {
-					// Keep previous list if the server can't refresh the list of checks
-					or.LogError(fmt.Errorf("Zabbix server unable to provide active check list for host %s: %s", host, localErr))
-				} else {
-					zo.key_filter[host] = hc
-				}
-			}
 
 		case pack, ok = <-inChan:
 			if !ok {
+				close(stopChan)
 				break
 			}
 
-			// Skip discard check if disable
-			if zo.conf.ZabbixChecksPollInterval != 0 {
-				if discard, err := zo.Filter(pack); err != nil {
+			// Skip discard check if key filtering is disabled
+			if zo.conf.ZabbixChecksPollInterval > 0 {
+				discard, err := zo.Filter(pack)
+				if err != nil {
 					or.LogError(err)
-					pack.Recycle()
-					continue
-				} else if discard {
+				}
+				if discard {
 					pack.Recycle()
 					continue
 				}
@@ -292,28 +344,12 @@ func (zo *ZabbixOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 				}
 			}
 
-		case <-keySeenCleanup:
-			if !ok {
-				break
-			}
-
-			for host, hs := range zo.key_seen {
-				for key, t := range hs {
-					if time.Now().After(t.Add(zo.key_seen_window)) {
-						delete(hs, key)
-					}
-				}
-				if len(hs) == 0 {
-					delete(zo.key_seen, host)
-				}
-			}
-
 		case rchan := <-zo.report_chan:
 			if !ok {
 				break
 			}
-
-			for host, hc := range zo.key_filter {
+			zo.key_filter.RLock()
+			for host, hc := range zo.key_filter.m {
 				// Fix for js cutting at dot in the field name
 				host = strings.Replace(host, ".", "_", -1)
 				rm := reportMsg{name: fmt.Sprintf("ActiveChecks-%s", host)}
@@ -326,7 +362,10 @@ func (zo *ZabbixOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 					rchan <- rm
 				}
 			}
-			for host, hs := range zo.key_seen {
+			zo.key_filter.RUnlock()
+
+			zo.key_seen.RLock()
+			for host, hs := range zo.key_seen.m {
 				host = strings.Replace(host, ".", "_", -1)
 				rm := reportMsg{name: fmt.Sprintf("KeySeen-%s", host)}
 				if hs != nil {
@@ -338,6 +377,7 @@ func (zo *ZabbixOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 					rchan <- rm
 				}
 			}
+			zo.key_seen.RUnlock()
 
 			close(rchan)
 		}
