@@ -121,21 +121,27 @@ func NetworkPayloadParserAndAnswer(conn net.Conn,
 			}
 			break
 		}
-		pack = <-ir.InChan()
-		pack.Message.SetUuid(uuid.NewRandom())
-		pack.Message.SetTimestamp(time.Now().UnixNano())
-		pack.Message.SetType("NetworkInput")
-		// Only TCP packets have a remote address.
-		if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
-			pack.Message.SetHostname(remoteAddr.String())
+
+		select {
+		case pack = <-ir.InChan():
+			pack.Message.SetUuid(uuid.NewRandom())
+			pack.Message.SetTimestamp(time.Now().UnixNano())
+			pack.Message.SetType("NetworkInput")
+			// Only TCP packets have a remote address.
+			if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
+				pack.Message.SetHostname(remoteAddr.String())
+			}
+			pack.Message.SetLogger(ir.Name())
+			pack.Message.SetPayload(string(record))
+			if dr == nil {
+				ir.Inject(pack)
+			} else {
+				dr.InChan() <- pack
+			}
+		default:
+			ir.LogMessage(fmt.Sprintf("Dropped record: %s", record))
 		}
-		pack.Message.SetLogger(ir.Name())
-		pack.Message.SetPayload(string(record))
-		if dr == nil {
-			ir.Inject(pack)
-		} else {
-			dr.InChan() <- pack
-		}
+
 	}
 	return
 }
